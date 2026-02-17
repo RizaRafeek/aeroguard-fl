@@ -2,37 +2,50 @@ import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
-def load_and_preprocess(file_path, window_size=30):
-    # 1. Load Data
+def load_and_preprocess(file_path, window_size=30, is_test=False, ground_truth_path=None):
+    """
+    Professional-grade preprocessing for NASA CMAPSS dataset.
+    Includes RUL calculation, rolling features, and scaling.
+    """
+    # 1. Define Column Names
     col_names = ['id', 'cycle', 'setting1', 'setting2', 'setting3'] + [f's{i}' for i in range(1, 22)]
-    df = pd.read_csv(file_path, sep='\s+', header=None, names=col_names)
     
-    # 2. Calculate RUL (Remaining Useful Life) - Our Target
-    # We find the max cycle for each engine and subtract current cycle
-    max_cycle = df.groupby('id')['cycle'].transform('max')
-    df['RUL'] = max_cycle - df.cycle
+    # 2. Load Data
+    # Using sep=r'\s+' because the NASA files are space-delimited
+    df = pd.read_csv(file_path, sep=r'\s+', header=None, names=col_names)
+
+    # 3. Handle Remaining Useful Life (RUL)
+    if not is_test:
+        # For training: RUL = Max Cycle - Current Cycle
+        max_cycle = df.groupby('id')['cycle'].transform('max')
+        df['RUL'] = max_cycle - df['cycle']
+    elif ground_truth_path:
+        # For testing: We eventually merge with the RUL_FD001.txt values
+        pass 
+
+    # 4. Feature Engineering: Rolling Means
+    # This turns 'noisy sensors' into 'clear trends'
+    sensor_cols = [f's{i}' for i in range(1, 22)]
     
-    # 3. Scale Features (MinMax Scaling is standard for Sensors)
+    for col in sensor_cols:
+        # Groupby 'id' is mandatory so engine data doesn't cross-contaminate
+        df[f'{col}_rolling_mean'] = df.groupby('id')[col].transform(
+            lambda x: x.rolling(window=window_size).mean()
+        )
+    
+    # Fill the NaNs at the start of each window so the model doesn't crash
+    df = df.ffill().bfill()
+
+    # 5. Scaling
+    # We scale both the raw sensors and our new rolling features
+    feature_cols = sensor_cols + [f'{c}_rolling_mean' for c in sensor_cols]
     scaler = MinMaxScaler()
-    feature_cols = [c for c in df.columns if c not in ['id', 'cycle', 'RUL']]
     df[feature_cols] = scaler.fit_transform(df[feature_cols])
     
-    # 4. Create Sliding Windows
-    X, y = [], []
-    for engine_id in df['id'].unique():
-        engine_data = df[df['id'] == engine_id]
-        if len(engine_data) < window_size:
-            continue # Professional handle: skip engines smaller than window
-            
-        for i in range(len(engine_data) - window_size + 1):
-            # Window of sensor data
-            X.append(engine_data.iloc[i:i+window_size][feature_cols].values)
-            # The label is the RUL at the END of the window
-            y.append(engine_data.iloc[i+window_size-1]['RUL'])
-            
-    return np.array(X), np.array(y)
+    return df
 
-if __name__ == "__main__":
-    path = '/workspaces/aeroguard-fl/data/raw/train_FD001.txt'
-    X, y = load_and_preprocess(path)
-    print(f"✅ Data Processed. Shape: {X.shape}, Labels: {y.shape}")
+def get_latest_cycles(df):
+    """
+    Extracts the last recorded cycle for each engine in the test set.
+    """
+    return df.groupby('id').last().reset_index()
